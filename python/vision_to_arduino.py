@@ -1,18 +1,23 @@
 # -- coding: utf-8 --
 """
-vision_to_arduino.py — Vision (sans fond vert), prêt à exécuter sans Arduino
-----------------------------------------------------------------------------
+vision_to_arduino.py — Vision + Arduino (<ripe,size> sur ENTER, O pour trappe)
+------------------------------------------------------------------------------
 
-- Ouvre la caméra index=1
-- Détecte le "rouge" (règle RR/GG/BB)
-- Sélectionne la framboise rouge la plus grande (par aire)
-- Vérifie la maturité (fraction de pixels rouges dans la boîte englobante)
-- Estime la largeur max (scan lignes) et convertit en mm avec calibration
-- Affiche les fenêtres "camera" et "mask_red"
+- Ouvre la caméra
+- Détecte la framboise rouge la plus grande
+- Vérifie si elle est mûre
+- Estime sa taille (petite / grande)
+- Affiche "camera" + "mask_red"
+- Quand on appuie sur ENTER :
+    -> envoie sur le port série : "<ripe_bit,size_bit>\n"
+       ripe_bit = 1 si mûre, 0 sinon
+       size_bit = 0 si petite, 1 si grande
+- Quand on appuie sur O :
+    -> envoie "O\n" à l'Arduino (séquence trappe)
 - Quitter : ESC ou 'q'
 
 Dépendances :
-    pip install opencv-python numpy
+    pip install opencv-python numpy pyserial
 """
 
 import time
@@ -20,13 +25,13 @@ from dataclasses import dataclass, asdict
 from typing import Optional
 import json
 import os
+import subprocess
+import re
 
 import cv2
 import numpy as np
 import serial
 import serial.tools.list_ports as list_ports
-import subprocess
-import re
 
 
 # =========================
@@ -40,7 +45,7 @@ class Config:
     cam_height: int = 720
     show_window: bool = True
 
-    # --- Détection "rouge" (RR/GG/BB) ---
+    # --- Détection "rouge" ---
     R_MIN: int = 120
     K_DOM: float = 1.05
     use_chromaticity: bool = True
@@ -53,7 +58,7 @@ class Config:
     morph_close_ks: int = 7
     min_area_px: int = 120
 
-    # --- Maturité (fraction de rouge dans la boîte) ---
+    # --- Maturité ---
     red_area_frac_min: float = 0.22
 
     # --- Calibration (pixels → mm) ---
@@ -61,13 +66,15 @@ class Config:
     REF_PX: float = 330.0
     override_mm_per_px: float = 0.0
 
-    # --- Décision petite/grande (mm) ---
+    # --- Décision petite/grande ---
     small_large_threshold_mm: float = 25.0
     size_large_mm: float = 30.0
     size_small_mm: float = 10.0
-    # --- Décision petite/grande (pixels) ---
-    # If >0, this pixel threshold takes precedence over the mm threshold.
+    # Si >0, le seuil en pixels est prioritaire.
     small_large_threshold_px: int = 575
+    # --- Bundle detection (3 raspberries) ---
+    bundle_aspect_ratio_threshold: float = 1.5  # width/height ratio to detect bundles
+    bundle_small_threshold_px: int = 1150  # 2× single threshold for bundle classification
     print_ascii: bool = True
 
     # --- Focus control ---
@@ -80,11 +87,11 @@ class Config:
     focus_auto_calibrate: bool = False
     focus_measure_frames: int = 2
 
-    # --- Serial / ASCII send ---
+    # --- Série vers Arduino ---
     serial_baud: int = 115200
-    ascii_message: str = "ENTER\n"
+    # Sur ta machine : Arduino Uno (COM3)
     forced_serial_port: str = "COM3"
-    # Optional forced backend name: 'DSHOW', 'MSMF' or 'DEFAULT' (None means auto)
+    # Optional: 'DSHOW', 'MSMF' ou 'DEFAULT'
     forced_backend: Optional[str] = None
 
 
@@ -93,7 +100,7 @@ CONFIG_FILENAME = "vision_config.json"
 
 
 def config_file_path() -> str:
-    return os.path.join(os.path.dirname(__file__), CONFIG_FILENAME)
+    return os.path.join(os.path.dirname(_file_), CONFIG_FILENAME)
 
 
 def save_config(cfg: Config) -> None:
@@ -104,6 +111,8 @@ def save_config(cfg: Config) -> None:
         print(f"💾 Config saved -> {p}")
     except Exception as e:
         print("❌ Échec sauvegarde config:", e)
+
+
 def load_config(cfg: Config) -> bool:
     p = config_file_path()
     if not os.path.isfile(p):
@@ -111,11 +120,8 @@ def load_config(cfg: Config) -> bool:
     try:
         with open(p, "r", encoding="utf-8") as f:
             data = json.load(f)
-        # update only known fields, MAIS on ignore cam_index
         for k, v in data.items():
             if k == "cam_index":
-                # on ne lit plus jamais cam_index depuis le fichier,
-                # la valeur "canonique" reste celle du code (ou de la CLI)
                 continue
             if k == "forced_serial_port" and getattr(cfg, "_cli_serial_port_override", False):
                 continue
@@ -136,32 +142,16 @@ def load_config(cfg: Config) -> bool:
 # =========================
 # Caméra
 # =========================
-def autodetect_camera(max_index: int = 4) -> Optional[int]:
-    for i in range(max_index):
-        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-        if cap.isOpened():
-            cap.release()
-            return i
-        cap.release()
-    return None
-
-
 def open_camera(cfg: Config):
-    # Try to find a device by name (Windows DirectShow) using ffmpeg, prefer Logitech
     def get_dshow_device_names():
-        """Return list of DirectShow device names discovered by ffmpeg, or [] if ffmpeg not available."""
         names = []
-        # Try ffmpeg first (prints device list to stderr). Not present on all machines.
         try:
-            p = subprocess.run([
-                "ffmpeg",
-                "-list_devices",
-                "true",
-                "-f",
-                "dshow",
-                "-i",
-                "dummy",
-            ], capture_output=True, text=True, timeout=4)
+            p = subprocess.run(
+                ["ffmpeg", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+                capture_output=True,
+                text=True,
+                timeout=4,
+            )
             out = p.stderr or p.stdout or ""
             ff_names = re.findall(r'"([^"]+)"', out)
             for n in ff_names:
@@ -169,17 +159,20 @@ def open_camera(cfg: Config):
                 if s:
                     names.append(s)
         except Exception:
-            # ffmpeg not available or failed; continue to PowerShell fallback below
             pass
 
-        # PowerShell fallback: Get-PnpDevice lists camera friendly names on Windows
         try:
-            p2 = subprocess.run([
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                "Get-PnpDevice -Class Camera | Select-Object -ExpandProperty FriendlyName",
-            ], capture_output=True, text=True, timeout=3)
+            p2 = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "Get-PnpDevice -Class Camera | Select-Object -ExpandProperty FriendlyName",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
             out2 = p2.stdout or ""
             for line in out2.splitlines():
                 s = line.strip()
@@ -188,7 +181,6 @@ def open_camera(cfg: Config):
         except Exception:
             pass
 
-        # return unique preserving order
         seen = set()
         res = []
         for n in names:
@@ -205,15 +197,13 @@ def open_camera(cfg: Config):
                 return n
         return None
 
-    # prefer explicit device name for Logitech if available
     try:
         logi_name = find_device_by_keywords(["LOGI", "LOGITECH", "C920", "C922", "C270", "WEBCAM"])
         if logi_name:
-            # try opening by name via DirectShow
             try:
                 cap_name = cv2.VideoCapture(f"video={logi_name}", cv2.CAP_DSHOW)
-                cap_name.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.cam_width)
-                cap_name.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.cam_height)
+                cap_name.set(cv2.CAP_PROP_FRAME_WIDTH, CFG.cam_width)
+                cap_name.set(cv2.CAP_PROP_FRAME_HEIGHT, CFG.cam_height)
                 ok, f = cap_name.read()
                 if ok and f is not None:
                     print(f"📷 Caméra OK (name='{logi_name}', opened via DSHOW)")
@@ -226,8 +216,8 @@ def open_camera(cfg: Config):
                 pass
     except Exception:
         pass
+
     def try_open(index: int, backend, retries: int = 6, delay: float = 0.15):
-        # backend can be None (default) or an OpenCV backend flag
         try:
             if backend is None:
                 cap_ = cv2.VideoCapture(index)
@@ -236,8 +226,8 @@ def open_camera(cfg: Config):
         except Exception:
             return None
         try:
-            cap_.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.cam_width)
-            cap_.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.cam_height)
+            cap_.set(cv2.CAP_PROP_FRAME_WIDTH, CFG.cam_width)
+            cap_.set(cv2.CAP_PROP_FRAME_HEIGHT, CFG.cam_height)
         except Exception:
             pass
         if not cap_.isOpened():
@@ -247,69 +237,68 @@ def open_camera(cfg: Config):
                 pass
             return None
 
-        # Try reading a few frames to allow camera warm-up or to overcome transient read failures
-        for attempt in range(retries):
+        for _ in range(retries):
             try:
                 ok, frame = cap_.read()
             except Exception:
                 ok, frame = False, None
             if ok and frame is not None:
                 return cap_
-            # try a grab/retrieve cycle as an alternative
             try:
                 cap_.grab()
             except Exception:
                 pass
             time.sleep(delay)
 
-        # nothing worked
         try:
             cap_.release()
         except Exception:
             pass
         return None
 
-    # prepare backend order: respect cfg.forced_backend if provided
     backend_map = {"DSHOW": cv2.CAP_DSHOW, "MSMF": cv2.CAP_MSMF, "DEFAULT": None}
     backends = []
-    if getattr(cfg, 'forced_backend', None):
-        name = (cfg.forced_backend or '').upper()
+    if getattr(cfg, "forced_backend", None):
+        name = (cfg.forced_backend or "").upper()
         if name in backend_map:
             backends.append(backend_map[name])
-    # append the usual order, skipping duplicates
     for b in (cv2.CAP_DSHOW, cv2.CAP_MSMF, None):
         if b not in backends:
             backends.append(b)
 
     def backend_name(b):
         if b is None:
-            return 'DEFAULT'
+            return "DEFAULT"
         if b == cv2.CAP_DSHOW:
-            return 'DSHOW'
+            return "DSHOW"
         if b == cv2.CAP_MSMF:
-            return 'MSMF'
+            return "MSMF"
         return str(b)
 
-    # First try the configured index across several backends
     for b in backends:
         cap = try_open(cfg.cam_index, b)
         if cap is not None:
             print(f"📷 Caméra OK (index={cfg.cam_index}, backend={backend_name(b)})")
             return cap
 
-    # Fallback: autodetect by trying indices with each backend
     MAX_IDX = 8
     for b in backends:
         for i in range(MAX_IDX):
             cap = try_open(i, b)
             if cap is not None:
-                print(f"📷 Caméra détectée (index={i}, backend={backend_name(b)}) — mais cam_index de la config n'est PAS modifié.")
+                print(
+                    f"📷 Caméra détectée (index={i}, backend={backend_name(b)}) "
+                    "— cam_index de la config n'est PAS modifié."
+                )
                 return cap
 
-    print("⚠  Aucune caméra disponible.")
+    print("⚠ Aucune caméra disponible.")
     return None
 
 
+# =========================
+# Série Arduino
+# =========================
 def find_arduino_port() -> Optional[str]:
     for p in list_ports.comports():
         d = (p.description or "").upper()
@@ -322,13 +311,14 @@ def find_arduino_port() -> Optional[str]:
 
 
 def open_serial(cfg: Config):
-    # If a forced port is set, try it first
-    if getattr(cfg, 'forced_serial_port', ''):
+    if getattr(cfg, "forced_serial_port", ""):
         port = cfg.forced_serial_port
+        print(f"🛈 Port série forcé: {port}")
     else:
         port = find_arduino_port()
+        print(f"🛈 Port série autodétecté: {port}")
     if not port:
-        print("ℹ  Aucun Arduino détecté (autodetection).")
+        print("ℹ Aucun Arduino détecté.")
         return None
     try:
         ser = serial.Serial(port, cfg.serial_baud, timeout=1)
@@ -340,21 +330,27 @@ def open_serial(cfg: Config):
         return None
 
 
-def send_ascii_message(ser, cfg: Config):
+def send_decision_message(ser, ripe_bit: int, size_bit: int):
+    """
+    Envoie sur le port série un message du type "<ripe,size>\n".
+    ripe_bit = 0/1, size_bit = 0/1
+    """
+    line = f"<{ripe_bit},{size_bit}>\n"
+    if ser is None:
+        print("❌ Pas de port série ouvert, message NON envoyé :", line.strip())
+        return
     try:
-        if ser is not None:
-            ser.write(cfg.ascii_message.encode('ascii'))
-            print(f"➡ Sent over serial: {cfg.ascii_message.strip()}")
-        else:
-            print(f"(No serial) Would send: {cfg.ascii_message.strip()}")
+        ser.write(line.encode("ascii"))
+        print(f"➡ Sent over serial: {line.strip()}")
     except Exception as e:
-        print("❌ Envoi ASCII échoué:", e)
+        print("❌ Envoi série échoué:", e)
 
 
+# =========================
+# Focus / netteté
+# =========================
 def set_camera_focus(cap, value: int) -> bool:
-    """Try to disable autofocus and set focus to value. Returns True if set() succeeded."""
     try:
-        # try to disable autofocus first
         try:
             cap.set(cv2.CAP_PROP_AUTOFOCUS, 0 if value is not None else 1)
         except Exception:
@@ -366,7 +362,6 @@ def set_camera_focus(cap, value: int) -> bool:
 
 
 def measure_sharpness(frame: np.ndarray) -> float:
-    """Sharpness metric: variance of Laplacian on the grayscale image."""
     try:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         lap = cv2.Laplacian(gray, cv2.CV_64F)
@@ -376,13 +371,8 @@ def measure_sharpness(frame: np.ndarray) -> float:
 
 
 def calibrate_focus(cap, cfg: Config) -> Optional[int]:
-    """
-    Sweep focus values and choose the one that maximizes sharpness.
-    Returns chosen focus value or None if calibration not possible.
-    """
     best_val = None
     best_score = -1.0
-    # clamp range
     lo = int(max(0, cfg.focus_min))
     hi = int(max(lo + 1, cfg.focus_max))
     step = max(1, int(cfg.focus_step))
@@ -390,10 +380,8 @@ def calibrate_focus(cap, cfg: Config) -> Optional[int]:
     for v in range(lo, hi + 1, step):
         ok = set_camera_focus(cap, v)
         if not ok:
-            # if setting focus isn't supported, abort calibration
             print(f"⚠ set focus {v} not supported by camera (abort calibration)")
             return None
-        # read a few frames to stabilize
         scores = []
         for _ in range(max(1, cfg.focus_measure_frames)):
             ret, f = cap.read()
@@ -418,26 +406,16 @@ def calibrate_focus(cap, cfg: Config) -> Optional[int]:
 # Vision (RR/GG/BB)
 # =========================
 def red_mask_rrggbb(bgr: np.ndarray, cfg: Config) -> np.ndarray:
-    """Masque binaire des pixels 'rouges' via règle RR/GG/BB avec fallback chromaticité.
-
-    Deux critères (OR):
-      - critère RGB dominance : R >= R_MIN  et R >= K_DOM*G et R >= K_DOM*B
-      - critère chromaticity : R/(R+G+B) >= chroma_r_min (utile pour rose pâle / flou)
-    """
-    # split and float
     B, G, R = cv2.split(bgr)
     Rf = R.astype(np.float32)
     Gf = G.astype(np.float32)
     Bf = B.astype(np.float32)
 
-    # RGB dominance mask
     mask_rgb = (R >= cfg.R_MIN) & (Rf >= cfg.K_DOM * Gf) & (Rf >= cfg.K_DOM * Bf)
 
-    # Chromaticity mask: R / (R+G+B)
     if cfg.use_chromaticity:
         sum_rgb = (Rf + Gf + Bf) + 1e-6
         r_ratio = Rf / sum_rgb
-        # compute saturation to avoid selecting near-white/desaturated areas
         try:
             hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
             Sat = hsv[:, :, 1].astype(np.float32)
@@ -457,7 +435,6 @@ def red_mask_rrggbb(bgr: np.ndarray, cfg: Config) -> np.ndarray:
 
 
 def clean_mask(mask: np.ndarray, open_ks: int, close_ks: int) -> np.ndarray:
-    """Ouverture/fermeture morphologique pour réduire bruit et combler trous."""
     if open_ks > 0:
         mask = cv2.morphologyEx(
             mask, cv2.MORPH_OPEN, np.ones((open_ks, open_ks), np.uint8)
@@ -470,7 +447,6 @@ def clean_mask(mask: np.ndarray, open_ks: int, close_ks: int) -> np.ndarray:
 
 
 def largest_component(mask: np.ndarray, min_area: int):
-    """Plus grand contour du masque (None si trop petit)."""
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return None, 0
@@ -482,7 +458,6 @@ def largest_component(mask: np.ndarray, min_area: int):
 
 
 def ripe_by_area_fraction(mask: np.ndarray, contour, frac_min: float) -> bool:
-    """'Mûr' si la fraction de rouge dans la boîte englobante ≥ seuil."""
     x, y, w, h = cv2.boundingRect(contour)
     roi = mask[y:y + h, x:x + w]
     red_px = int((roi > 0).sum())
@@ -491,18 +466,13 @@ def ripe_by_area_fraction(mask: np.ndarray, contour, frac_min: float) -> bool:
 
 
 def max_width_pixels_by_scan(mask: np.ndarray, contour) -> int:
-    """
-    Largeur maximale en pixels par scan lignes :
-      - pour chaque ligne de la ROI, on prend le premier et dernier pixel >0
-      - largeur ligne = last-first+1 ; on garde la plus grande.
-    """
     x, y, w, h = cv2.boundingRect(contour)
     roi = mask[y:y + h, x:x + w]
     max_span = 0
-    for row in range(roi.shape[0]):      # lignes
+    for row in range(roi.shape[0]):
         first = -1
         last = -1
-        for col in range(roi.shape[1]):  # colonnes
+        for col in range(roi.shape[1]):
             if roi[row, col] > 0:
                 if first == -1:
                     first = col
@@ -524,15 +494,16 @@ def mm_per_pixel(cfg: Config) -> float:
 # Boucle principale
 # =========================
 def main():
-    print("✅ Démarrage vision (sans fond vert)…")
-    print("=== VERSION ENTER + SERIAL ===")
-    # tenter de charger une config existante (REF_MM/REF_PX, focus_value, etc.)
+    print("✅ Démarrage vision…")
+    print("=== ENTER -> <ripe,size>, O -> 'O' pour trappe ===")
+
     try:
         load_config(CFG)
     except Exception:
         pass
+
     cap = open_camera(CFG)
-    # Appliquer contrôle focus si demandé
+
     if cap is not None and CFG.use_focus_control:
         try:
             if CFG.focus_auto_calibrate:
@@ -540,7 +511,6 @@ def main():
                 if choice is None:
                     print("ℹ Calibration focus impossible — essayer une valeur manuelle.")
                 else:
-                    # mémoriser la valeur trouvée
                     try:
                         CFG.focus_value = int(choice)
                         save_config(CFG)
@@ -551,20 +521,17 @@ def main():
                 print(f"🔧 Set focus -> {CFG.focus_value} (success={okf})")
         except Exception as e:
             print("⚠ Erreur durant le contrôle du focus:", e)
-    # Ouvrir le port série (si détecté ou forcé)
-    ser = None
-    try:
-        ser = open_serial(CFG)
-    except Exception:
-        ser = None
+
+    ser = open_serial(CFG)
+    print("DEBUG: SER =", ser)
 
     mm_per_px = mm_per_pixel(CFG)
-    # tolérance pour la visibilité des fenêtres (évite sortie immédiate sur backends non-GUI)
-    win_vis_fail_count = 0
-    WIN_VIS_FAIL_THRESHOLD = 3
     if mm_per_px <= 0:
         print("⚠ Calibration pixels→mm invalide. On met 1.0 par sécurité.")
         mm_per_px = 1.0
+
+    win_vis_fail_count = 0
+    WIN_VIS_FAIL_THRESHOLD = 3
 
     try:
         while True:
@@ -580,16 +547,10 @@ def main():
                 cap = None
                 continue
 
-            # Lissage léger
             blur = cv2.GaussianBlur(frame, (5, 5), 0)
-
-            # Masque rouge uniquement
             mask_red = red_mask_rrggbb(blur, CFG)
-
-            # Nettoyage
             mask = clean_mask(mask_red, CFG.morph_open_ks, CFG.morph_close_ks)
 
-            # Détection plus grande framboise
             contour, _ = largest_component(mask, CFG.min_area_px)
 
             ripe = False
@@ -598,25 +559,35 @@ def main():
             size_label = "UNKNOWN"
 
             if contour is not None:
-                # maturité = fraction rouge dans la boîte
                 ripe = ripe_by_area_fraction(mask, contour, CFG.red_area_frac_min)
-                # largeur max (scan lignes)
-                width_px = max_width_pixels_by_scan(mask, contour)
+                x, y, w, h = cv2.boundingRect(contour)
+                
+                # Check aspect ratio to detect bundles (elongated shape = 3 raspberries)
+                try:
+                    aspect_ratio = float(max(w, h)) / max(1.0, float(min(w, h)))
+                except Exception:
+                    aspect_ratio = 1.0
+                
+                is_bundle = aspect_ratio > CFG.bundle_aspect_ratio_threshold
+                
+                # For bundles: use max width; for single: use smaller dimension
+                if is_bundle:
+                    width_px = int(max(w, h))
+                    # Classify bundle as small or large using bundle threshold
+                    size_label = "SMALL" if width_px < CFG.bundle_small_threshold_px else "LARGE"
+                else:
+                    # Single raspberry: use minimum dimension as diameter
+                    width_px = int(min(w, h))
+                    # Use single raspberry threshold
+                    if getattr(CFG, 'small_large_threshold_px', 0) and CFG.small_large_threshold_px > 0:
+                        size_label = "SMALL" if width_px < CFG.small_large_threshold_px else "LARGE"
+                    else:
+                        width_mm = width_px * mm_per_px
+                        size_label = "SMALL" if width_mm < CFG.small_large_threshold_mm else "LARGE"
+                
                 width_mm = width_px * mm_per_px
-                size_label = (
-                    "SMALL"
 
-
-
-
-
-                    if width_mm < CFG.small_large_threshold_mm
-                    else "LARGE"
-                )
-
-                # Dessins debug
                 if CFG.show_window:
-                    x, y, w, h = cv2.boundingRect(contour)
                     cv2.rectangle(
                         frame,
                         (x, y),
@@ -624,32 +595,24 @@ def main():
                         (0, 255, 0) if ripe else (0, 0, 255),
                         2,
                     )
+                    # Format display text based on bundle/single and ripe status
+                    if ripe:
+                        if is_bundle:
+                            display_text = f"bundle : {size_label.lower()}"
+                        else:
+                            display_text = f"single : {size_label.lower()}"
+                    else:
+                        display_text = "unripe raspberries"
+                    
                     cv2.putText(
                         frame,
-                        f"ripe={int(ripe)} width={width_mm:.1f}mm "
-                        f"({width_px}px) {size_label}",
+                        display_text,
                         (x, max(0, y - 8)),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.6,
                         (255, 255, 255),
                         2,
                     )
-                    # If a pixel-based threshold is configured, recompute label and redraw
-                    if getattr(CFG, 'small_large_threshold_px', 0) and CFG.small_large_threshold_px > 0:
-                        try:
-                            size_label = "SMALL" if width_px < CFG.small_large_threshold_px else "LARGE"
-                            cv2.putText(
-                                frame,
-                                f"ripe={int(ripe)} width={width_mm:.1f}mm "
-                                f"({width_px}px) {size_label}",
-                                (x, max(0, y - 8)),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.6,
-                                (255, 255, 255),
-                                2,
-                            )
-                        except Exception:
-                            pass
             else:
                 if CFG.show_window:
                     cv2.putText(
@@ -662,17 +625,13 @@ def main():
                         2,
                     )
 
-
-            # Affichage
             if CFG.show_window:
                 try:
                     cv2.imshow("camera", frame)
                     cv2.imshow("mask_red", mask)
                 except Exception:
-                    # imshow peut échouer en headless; on ignore ici
                     pass
 
-                # Quitter si l’utilisateur ferme une fenêtre — tolérance courte
                 try:
                     vis_cam = cv2.getWindowProperty("camera", cv2.WND_PROP_VISIBLE)
                     vis_mask = cv2.getWindowProperty("mask_red", cv2.WND_PROP_VISIBLE)
@@ -684,36 +643,44 @@ def main():
                         print("⚠ Fenêtres fermées ou non visibles — sortie.")
                         break
                 except Exception:
-                    # getWindowProperty peut lever selon backend — ne pas quitter du coup
                     pass
 
-            # ASCII output pour Arduino
-            if CFG.print_ascii:
-                try:
-                    ripe_bit = 1 if ripe else 0
-                    # Compute size_bit consistently with display: prefer pixel threshold
-                    if getattr(CFG, 'small_large_threshold_px', 0) and CFG.small_large_threshold_px > 0:
-                        size_bit = 1 if width_px >= CFG.small_large_threshold_px else 0
-                    else:
-                        size_bit = 1 if width_mm >= CFG.size_large_mm else 0
+            # Calcul des bits ripe / size
+            try:
+                ripe_bit = 1 if ripe else 0
+                # size_bit: 1=large (single or bundle), 0=small (single or bundle)
+                size_bit = 1 if size_label == "LARGE" else 0
+
+                if CFG.print_ascii:
                     print(f"<{ripe_bit},{size_bit}>")
-                except Exception:
-                    # guard
-                    pass
+            except Exception:
+                ripe_bit = 0
+                size_bit = 0
 
-            # Clavier
+            # --- Clavier ---
             k = cv2.waitKey(1) & 0xFF
-            if k == 27 or k == ord("q"):  # ESC ou 'q'
+
+            if k == 27 or k == ord("q"):   # Quit
                 break
-            elif k == 13 or k == 10:  # Enter key
-                send_ascii_message(ser, CFG)
+
+            elif k == 13 or k == 10:       # ENTER → envoyer <ripe,size>
+                send_decision_message(ser, ripe_bit, size_bit)
+
+            elif k == ord("o") or k == ord("O"):  # O → séquence trappe
+                if ser is not None:
+                    try:
+                        ser.write(b"O\n")
+                        print("➡ Sent over serial: O (sequence trappe)")
+                    except Exception as e:
+                        print("❌ Envoi série O échoué:", e)
+                else:
+                    print("(No serial) Would send: O")
 
     except KeyboardInterrupt:
         print("\n⛔ Interruption clavier (Ctrl+C).")
     finally:
         if cap is not None:
             cap.release()
-        # sauvegarde automatique de la config courante
         try:
             save_config(CFG)
         except Exception:
@@ -725,14 +692,12 @@ def main():
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Vision -> Arduino (press Enter to send)")
+    parser = argparse.ArgumentParser(description="Vision -> Arduino (<ripe,size> sur ENTER, O = trappe)")
     parser.add_argument("--cam-index", type=int, help="Override camera index (e.g. 1 for Logitech)")
     parser.add_argument("--serial-port", type=str, help="Force serial port (e.g. COM3)")
-    parser.add_argument("--list-cams", action="store_true", help="List available camera indices/backends and exit")
-    parser.add_argument("--choose-camera", action="store_true", help="Prompt to choose which detected camera to use")
+    parser.add_argument("--choose-camera", action="store_true", help="Prompt pour choisir la caméra")
     args = parser.parse_args()
 
-    # apply overrides before running
     if args.cam_index is not None:
         try:
             CFG.cam_index = int(args.cam_index)
@@ -740,56 +705,18 @@ if __name__ == "__main__":
             CFG._cli_cam_index_override = True
         except Exception:
             pass
-        # Persist the chosen index immediately so subsequent runs use it without CLI
         try:
             save_config(CFG)
         except Exception:
             pass
+
     if args.serial_port:
         CFG.forced_serial_port = args.serial_port
         print(f"🔧 CLI override: forced_serial_port -> {CFG.forced_serial_port}")
         CFG._cli_serial_port_override = True
-    # optional forced backend
-    if getattr(args, 'cam_backend', None):
-        try:
-            CFG.forced_backend = str(args.cam_backend).upper()
-            print(f"🔧 CLI override: forced_backend -> {CFG.forced_backend}")
-            CFG._cli_forced_backend_override = True
-        except Exception:
-            pass
 
-    if args.list_cams:
-        # quick scan across backends and indices and print results
-        backends = [(cv2.CAP_DSHOW, 'DSHOW'), (cv2.CAP_MSMF, 'MSMF'), (None, 'DEFAULT')]
-        print("🔎 Scanning cameras (this may take a few seconds)…")
-        for b_flag, b_name in backends:
-            print(f"  Backend: {b_name}")
-            found = False
-            for i in range(8):
-                try:
-                    if b_flag is None:
-                        c = cv2.VideoCapture(i)
-                    else:
-                        c = cv2.VideoCapture(i, b_flag)
-                    ok = c.isOpened()
-                    if ok:
-                        # quick read test
-                        r, f = c.read()
-                        if r and f is not None:
-                            print(f"    Index {i}: OK")
-                            found = True
-                        else:
-                            print(f"    Index {i}: opened but no frame")
-                    c.release()
-                except Exception:
-                    pass
-            if not found:
-                print("    (no cameras found for this backend)")
-        raise SystemExit(0)
-
-    # If requested, or if multiple cameras detected, prompt the user to choose which to use
     if args.choose_camera:
-        backends = [(cv2.CAP_DSHOW, 'DSHOW'), (cv2.CAP_MSMF, 'MSMF'), (None, 'DEFAULT')]
+        backends = [(cv2.CAP_DSHOW, "DSHOW"), (cv2.CAP_MSMF, "MSMF"), (None, "DEFAULT")]
         candidates = []
         print("🔎 Scanning cameras for interactive choice…")
         for b_flag, b_name in backends:
@@ -823,49 +750,3 @@ if __name__ == "__main__":
                 print("Invalid selection, using config values.")
 
     main()
-
-
-# =============================================================================
-# =======================  ARDUINO (EN COMMENTAIRE)  ==========================
-# =============================================================================
-# Pour activer l'envoi série plus tard, dé-commentez ce bloc et les appels.
-#
-# import serial
-# import serial.tools.list_ports as list_ports
-#
-# def find_arduino_port() -> Optional[str]:
-#     for p in list_ports.comports():
-#         d = (p.description or "").upper()
-#         h = (p.hwid or "").upper()
-#         if any(k in d for k in ["ARDUINO", "CH340", "USB-SERIAL"]) or any(
-#             v in h for v in ["VID:2341", "VID:2A03", "VID:1A86"]
-#         ):
-#             return p.device
-#     return None
-#
-# def open_serial(baud: int = 115200):
-#     port = find_arduino_port()
-#     if not port:
-#         print("ℹ  Aucun Arduino détecté.")
-#         return None
-#     try:
-#         ser = serial.Serial(port, baud, timeout=1)
-#         time.sleep(2)  # reset auto Uno
-#         print(f"🔌 Arduino connecté sur {port} @ {baud}")
-#         return ser
-#     except Exception as e:
-#         print("❌ Échec connexion série :", e)
-#         return None
-#
-# def send_grab_command(ser, width_mm: float, size_label: str):
-#     line = f"GRAB,{size_label},{int(round(width_mm))}\n"
-#     try:
-#         ser.write(line.encode("ascii"))
-#     except Exception as e:
-#         print("❌ Envoi série échoué :", e)
-#
-# # Exemple d’usage dans la boucle principale :
-# # ser = open_serial()
-# # if ser is not None and ripe:
-# #     send_grab_command(ser, width_mm, size_label)
-# # ser.close()
