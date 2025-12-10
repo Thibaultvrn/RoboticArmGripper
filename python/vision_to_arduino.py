@@ -68,10 +68,10 @@ class Config:
     v_min_considered: int = 40
     # --- Variante rose (tolérer des framboises claires) ---
     pink_enabled: bool = True
-    pink_h_low: int = 150
-    pink_h_high: int = 175
-    pink_s_min: int = 80
-    pink_v_min: int = 120
+    pink_h_low: int = 145
+    pink_h_high: int = 178
+    pink_s_min: int = 40   # plus bas pour laisser passer le rose pâle
+    pink_v_min: int = 80   # plus bas pour rose peu saturé / peu lumineux
 
     # --- Nettoyage masque ---
     morph_open_ks: int = 5
