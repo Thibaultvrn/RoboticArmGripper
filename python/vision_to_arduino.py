@@ -46,20 +46,34 @@ class Config:
     show_window: bool = True
 
     # --- Détection "rouge" ---
-    R_MIN: int = 120
+    R_MIN: int = 140
     K_DOM: float = 1.05
     use_chromaticity: bool = True
-    chroma_r_min: float = 0.34
+    chroma_r_min: float = 0.36
     chroma_r_min_relaxed: float = 0.30
-    chroma_s_min: int = 40
+    chroma_s_min: int = 60
+    # --- Détection HSV (réduit les faux positifs, inspiré du classificateur C) ---
+    red_h_low_1: int = 0
+    red_h_high_1: int = 10
+    red_h_low_2: int = 170
+    red_h_high_2: int = 180
+    red_s_min: int = 140
+    red_v_min: int = 110
+    glare_v_min: int = 230
+    glare_s_max: int = 30
+    green_h_low: int = 35
+    green_h_high: int = 85
+    green_s_min: int = 60
+    green_v_min: int = 60
+    v_min_considered: int = 40
 
     # --- Nettoyage masque ---
     morph_open_ks: int = 5
     morph_close_ks: int = 7
-    min_area_px: int = 120
+    min_area_px: int = 180
 
     # --- Maturité ---
-    red_area_frac_min: float = 0.22
+    red_area_frac_min: float = 0.28
 
     # --- Calibration (pixels → mm) ---
     REF_MM: float = 30.0
@@ -68,10 +82,15 @@ class Config:
 
     # --- Décision petite/grande ---
     small_large_threshold_mm: float = 25.0
+    size_small_mm: float = 15.0
     size_large_mm: float = 30.0
-    size_small_mm: float = 10.0
+    size_ratio_large_to_small: float = 2.0
     # Si >0, le seuil en pixels est prioritaire.
     small_large_threshold_px: int = 575
+    # --- Zone de détection (viseur) ---
+    roi_radius_px: int = 220
+    crosshair_color: tuple = (0, 255, 255)
+    crosshair_thickness: int = 2
     # --- Bundle detection (3 raspberries) ---
     bundle_aspect_ratio_threshold: float = 1.5  # width/height ratio to detect bundles
     bundle_small_threshold_px: int = 1150  # 2× single threshold for bundle classification
@@ -100,7 +119,7 @@ CONFIG_FILENAME = "vision_config.json"
 
 
 def config_file_path() -> str:
-    return os.path.join(os.path.dirname(_file_), CONFIG_FILENAME)
+    return os.path.join(os.path.dirname(__file__), CONFIG_FILENAME)
 
 
 def save_config(cfg: Config) -> None:
@@ -406,32 +425,67 @@ def calibrate_focus(cap, cfg: Config) -> Optional[int]:
 # Vision (RR/GG/BB)
 # =========================
 def red_mask_rrggbb(bgr: np.ndarray, cfg: Config) -> np.ndarray:
-    B, G, R = cv2.split(bgr)
-    Rf = R.astype(np.float32)
-    Gf = G.astype(np.float32)
-    Bf = B.astype(np.float32)
+    """
+    Détection rouge inspirée du classificateur C (HSV + exclusions vert/éblouissement).
+    Plus stricte que l'ancienne heuristique RGB pour limiter les faux positifs.
+    """
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
 
-    mask_rgb = (R >= cfg.R_MIN) & (Rf >= cfg.K_DOM * Gf) & (Rf >= cfg.K_DOM * Bf)
+    def clamp(val, lo, hi):
+        return max(lo, min(hi, val))
 
-    if cfg.use_chromaticity:
-        sum_rgb = (Rf + Gf + Bf) + 1e-6
-        r_ratio = Rf / sum_rgb
-        try:
-            hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-            Sat = hsv[:, :, 1].astype(np.float32)
-        except Exception:
-            Sat = np.zeros_like(Rf)
-        mask_chroma = (
-            (r_ratio >= cfg.chroma_r_min)
-            & (Rf >= (cfg.R_MIN // 2))
-            & (Sat >= float(cfg.chroma_s_min))
-            & (Rf >= 60)
-        )
+    # Clamp pour éviter les valeurs hors plage si modifiées dans la config.
+    rh1_lo = clamp(cfg.red_h_low_1, 0, 179)
+    rh1_hi = clamp(cfg.red_h_high_1, 0, 179)
+    rh2_lo = clamp(cfg.red_h_low_2, 0, 179)
+    rh2_hi = clamp(cfg.red_h_high_2, 0, 179)
+    rs_min = clamp(cfg.red_s_min, 0, 255)
+    rv_min = clamp(cfg.red_v_min, 0, 255)
+    glare_v = clamp(cfg.glare_v_min, 0, 255)
+    glare_s = clamp(cfg.glare_s_max, 0, 255)
+    gh_lo = clamp(cfg.green_h_low, 0, 179)
+    gh_hi = clamp(cfg.green_h_high, 0, 179)
+    gs_min = clamp(cfg.green_s_min, 0, 255)
+    gv_min = clamp(cfg.green_v_min, 0, 255)
+    v_considered = clamp(cfg.v_min_considered, 0, 255)
+
+    # Masque éblouissement (très lumineux + peu saturé) pour exclusion.
+    mask_glare = cv2.inRange(v, glare_v, 255) & cv2.inRange(s, 0, glare_s)
+
+    # Masque vert (feuilles/tiges) pour exclusion.
+    if gh_lo <= gh_hi:
+        mask_h_green = cv2.inRange(h, gh_lo, gh_hi)
     else:
-        mask_chroma = np.zeros_like(R, dtype=np.bool_)
+        # Gestion wrap-around
+        range1 = cv2.inRange(h, gh_lo, 179)
+        range2 = cv2.inRange(h, 0, gh_hi)
+        mask_h_green = cv2.bitwise_or(range1, range2)
+    mask_s_green = cv2.inRange(s, gs_min, 255)
+    mask_v_green = cv2.inRange(v, gv_min, 255)
+    mask_green = cv2.bitwise_and(mask_h_green, mask_s_green)
+    mask_green = cv2.bitwise_and(mask_green, mask_v_green)
 
-    mask = (mask_rgb | mask_chroma).astype(np.uint8) * 255
-    return mask
+    # Pixels considérés: assez lumineux, pas éblouis, pas verts.
+    mask_v_valid = cv2.inRange(v, v_considered, 255)
+    mask_considered = cv2.bitwise_and(mask_v_valid, cv2.bitwise_not(mask_glare))
+    mask_considered = cv2.bitwise_and(mask_considered, cv2.bitwise_not(mask_green))
+
+    # Rouge = deux intervalles de teinte + seuils S/V, puis intersection avec pixels considérés.
+    mask_red = np.zeros_like(h, dtype=np.uint8)
+    if rh1_lo <= rh1_hi:
+        mask_red = cv2.bitwise_or(
+            mask_red,
+            cv2.inRange(hsv, (rh1_lo, rs_min, rv_min), (rh1_hi, 255, 255)),
+        )
+    if rh2_lo <= rh2_hi:
+        mask_red = cv2.bitwise_or(
+            mask_red,
+            cv2.inRange(hsv, (rh2_lo, rs_min, rv_min), (rh2_hi, 255, 255)),
+        )
+
+    mask_red = cv2.bitwise_and(mask_red, mask_considered)
+    return mask_red
 
 
 def clean_mask(mask: np.ndarray, open_ks: int, close_ks: int) -> np.ndarray:
@@ -547,9 +601,16 @@ def main():
                 cap = None
                 continue
 
+            h, w = frame.shape[:2]
+            cx, cy = w // 2, h // 2
+            roi_radius = min(CFG.roi_radius_px, max(1, min(cx, cy) - 5))
+            roi_mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.circle(roi_mask, (cx, cy), roi_radius, 255, -1)
+
             blur = cv2.GaussianBlur(frame, (5, 5), 0)
             mask_red = red_mask_rrggbb(blur, CFG)
             mask = clean_mask(mask_red, CFG.morph_open_ks, CFG.morph_close_ks)
+            mask = cv2.bitwise_and(mask, roi_mask)
 
             contour, _ = largest_component(mask, CFG.min_area_px)
 
@@ -578,12 +639,16 @@ def main():
                 else:
                     # Single raspberry: use minimum dimension as diameter
                     width_px = int(min(w, h))
-                    # Use single raspberry threshold
-                    if getattr(CFG, 'small_large_threshold_px', 0) and CFG.small_large_threshold_px > 0:
-                        size_label = "SMALL" if width_px < CFG.small_large_threshold_px else "LARGE"
+                    # Use two-step thresholds with ratio 2x between small and large
+                    if getattr(CFG, "small_large_threshold_px", 0) and CFG.small_large_threshold_px > 0:
+                        small_thr_px = CFG.small_large_threshold_px
+                        large_thr_px = int(round(CFG.small_large_threshold_px * CFG.size_ratio_large_to_small))
+                        size_label = "LARGE" if width_px >= large_thr_px else "SMALL"
                     else:
                         width_mm = width_px * mm_per_px
-                        size_label = "SMALL" if width_mm < CFG.small_large_threshold_mm else "LARGE"
+                        small_thr_mm = CFG.size_small_mm
+                        large_thr_mm = max(CFG.size_large_mm, CFG.size_small_mm * CFG.size_ratio_large_to_small)
+                        size_label = "LARGE" if width_mm >= large_thr_mm else "SMALL"
                 
                 width_mm = width_px * mm_per_px
 
@@ -627,6 +692,22 @@ def main():
 
             if CFG.show_window:
                 try:
+                    # Viseur rond + croix au centre
+                    cv2.circle(frame, (cx, cy), roi_radius, CFG.crosshair_color, CFG.crosshair_thickness)
+                    cv2.line(
+                        frame,
+                        (max(0, cx - roi_radius), cy),
+                        (min(w - 1, cx + roi_radius), cy),
+                        CFG.crosshair_color,
+                        CFG.crosshair_thickness,
+                    )
+                    cv2.line(
+                        frame,
+                        (cx, max(0, cy - roi_radius)),
+                        (cx, min(h - 1, cy + roi_radius)),
+                        CFG.crosshair_color,
+                        CFG.crosshair_thickness,
+                    )
                     cv2.imshow("camera", frame)
                     cv2.imshow("mask_red", mask)
                 except Exception:
