@@ -65,13 +65,13 @@ class Config:
     green_h_high: int = 85
     green_s_min: int = 60
     green_v_min: int = 60
-    v_min_considered: int = 40
+    v_min_considered: int = 30  # un peu plus tolérant pour les teintes claires
     # --- Variante rose (tolérer des framboises claires) ---
     pink_enabled: bool = True
-    pink_h_low: int = 145
-    pink_h_high: int = 178
-    pink_s_min: int = 40   # plus bas pour laisser passer le rose pâle
-    pink_v_min: int = 80   # plus bas pour rose peu saturé / peu lumineux
+    pink_h_low: int = 140
+    pink_h_high: int = 179
+    pink_s_min: int = 20   # encore plus bas pour laisser passer le rose très pâle
+    pink_v_min: int = 60   # plus bas pour rose peu saturé / peu lumineux
 
     # --- Nettoyage masque ---
     morph_open_ks: int = 5
