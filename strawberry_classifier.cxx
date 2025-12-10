@@ -19,6 +19,8 @@
 #include <math.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -81,10 +83,10 @@ static const strawberry_params_t kDefaultParams = {
     10,    /* red_h_high_1 */
     170,   /* red_h_low_2 */
     180,   /* red_h_high_2 */
-    80,    /* red_s_min */
-    80,    /* red_v_min */
-    40,    /* white_s_max */
-    160,   /* white_v_min */
+    140,   /* red_s_min (tight: ignore pale/pastel) */
+    110,   /* red_v_min (tight: ignore dim/pastel) */
+    30,    /* white_s_max */
+    170,   /* white_v_min */
     230,   /* glare_v_min */
     30,    /* glare_s_max */
     35,    /* green_h_low */
@@ -95,8 +97,8 @@ static const strawberry_params_t kDefaultParams = {
     3,     /* morph_open_kernel */
     5,     /* morph_close_kernel */
     0.25f, /* red_min_fraction */
-    0.25f, /* white_min_fraction */
-    0.10f, /* decision_margin */
+    1.10f, /* white_min_fraction (effectively disable white detection) */
+    0.15f, /* decision_margin (reduce borderline hits) */
     40,    /* v_min_considered */
     1,     /* downscale_factor */
     0      /* enable_debug */
@@ -367,56 +369,172 @@ extern "C" int classify_strawberry_bgr(const unsigned char* bgr_ptr,
     return 0;
 }
 
-#ifdef STRAWBERRY_DEMO
-// Demo executable: load an image, run classifier, print decision, and display ROI.
-int main(int argc, char** argv) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s image_path\n", argv[0]);
-        return 1;
+static const char* label_to_string(strawberry_label_t label) {
+    switch (label) {
+        case STRAWBERRY_RED:
+            return "RED";
+        case STRAWBERRY_WHITE:
+            return "WHITE";
+        default:
+            return "UNKNOWN";
     }
+}
 
-    // Load a BGR image; OpenCV returns an empty matrix on failure.
-    cv::Mat image = cv::imread(argv[1], cv::IMREAD_COLOR);
-    if (image.empty()) {
-        fprintf(stderr, "Failed to load image: %s\n", argv[1]);
-        return 1;
+// Draws a circular reticle (circle + small cross) at the given center/radius.
+static void draw_reticle(cv::Mat& frame,
+                         const cv::Point& center,
+                         int radius,
+                         const cv::Scalar& color,
+                         int thickness) {
+    cv::circle(frame, center, radius, color, thickness);
+    const int cross_len = int_max(4, radius / 4);
+    cv::line(frame,
+             cv::Point(center.x - cross_len, center.y),
+             cv::Point(center.x + cross_len, center.y),
+             color,
+             thickness);
+    cv::line(frame,
+             cv::Point(center.x, center.y - cross_len),
+             cv::Point(center.x, center.y + cross_len),
+             color,
+             thickness);
+}
+
+// Try to open a camera using a few common backends/indices to reduce "empty frame" issues.
+static bool open_camera(cv::VideoCapture& cap) {
+    int preferred_index = 0;
+    if (const char* env = getenv("WEBCAM_DEVICE_INDEX")) {
+        preferred_index = atoi(env);
     }
+    const int backends[] = {
+#ifdef CV_CAP_AVFOUNDATION
+        cv::CAP_AVFOUNDATION,
+#endif
+        cv::CAP_ANY,
+    };
+    for (int b = 0; b < (int)(sizeof(backends) / sizeof(backends[0])); ++b) {
+        cv::VideoCapture candidate;
+        if (candidate.open(preferred_index, backends[b]) && candidate.isOpened()) {
+            cap = std::move(candidate);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Annotate a frame with a circular reticle and classification result.
+static bool classify_and_overlay(cv::Mat& frame,
+                                 bool use_roi,
+                                 const cv::Scalar& text_color,
+                                 double text_scale,
+                                 int text_thickness) {
+    const int roi_percent = use_roi ? 60 : int_max(1, int_min(100, kDefaultParams.roi_percent));
+    const double roi_ratio = (double)roi_percent / 100.0;
+    const int roi_diameter = int_max(
+        1, (int)((double)int_min(frame.cols, frame.rows) * roi_ratio + 0.5));
+    const int circle_radius = roi_diameter / 2;
+    const cv::Point center(frame.cols / 2, frame.rows / 2);
+
+    const int roi_x = center.x - circle_radius;
+    const int roi_y = center.y - circle_radius;
+    cv::Rect roi_rect(roi_x, roi_y, roi_diameter, roi_diameter);
+    roi_rect = roi_rect & cv::Rect(0, 0, frame.cols, frame.rows);
+
+    cv::Mat view = use_roi ? frame(roi_rect) : frame;
 
     strawberry_result_t result;
-    if (classify_strawberry_bgr(image.data,
-                                image.cols,
-                                image.rows,
+    if (classify_strawberry_bgr(view.data,
+                                view.cols,
+                                view.rows,
                                 0,
                                 NULL,
                                 &result) != 0) {
-        fprintf(stderr, "Classification failed.\n");
-        return 1;
+        fprintf(stderr, "Classification failed on frame.\n");
+        return false;
     }
 
-    const char* label_str = "UNKNOWN";
-    if (result.label == STRAWBERRY_RED) {
-        label_str = "RED";
-    } else if (result.label == STRAWBERRY_WHITE) {
-        label_str = "WHITE";
-    }
-    printf("Decision: %s, red_fraction=%.3f, white_fraction=%.3f, confidence=%.3f\n",
-           label_str,
-           result.red_fraction,
-           result.white_fraction,
-           result.confidence);
+    draw_reticle(frame, center, circle_radius, text_color, 2);
 
-    // Visualise the ROI so users can confirm the analysed area.
-    const int roi_percent = int_max(1, int_min(100, kDefaultParams.roi_percent));
-    const double roi_ratio = (double)roi_percent / 100.0;
-    int roi_width = (int)((double)image.cols * roi_ratio + 0.5);
-    int roi_height = (int)((double)image.rows * roi_ratio + 0.5);
-    roi_width = int_max(1, int_min(image.cols, roi_width));
-    roi_height = int_max(1, int_min(image.rows, roi_height));
-    const int roi_x = (image.cols - roi_width) / 2;
-    const int roi_y = (image.rows - roi_height) / 2;
-    cv::rectangle(image, cv::Rect(roi_x, roi_y, roi_width, roi_height), cv::Scalar(0, 255, 255), 2);
-    cv::imshow("Strawberry ROI", image);
-    cv::waitKey(0);
+    const char* label_str = label_to_string(result.label);
+    const bool detected = (result.label == STRAWBERRY_RED);
+    char text[128];
+    snprintf(text,
+             sizeof(text),
+             "%s (r=%.2f w=%.2f conf=%.2f)",
+             label_str,
+             result.red_fraction,
+             result.white_fraction,
+             result.confidence);
+    const int text_x = roi_rect.x + 5;
+    const int text_y =
+        (roi_rect.y - 10 < 20) ? (roi_rect.y + roi_rect.height + 25) : (roi_rect.y - 10);
+    cv::putText(frame,
+                text,
+                cv::Point(text_x, text_y),
+                cv::FONT_HERSHEY_SIMPLEX,
+                text_scale,
+                text_color,
+                text_thickness);
+    const int status_y = text_y + 25;
+    cv::putText(frame,
+                detected ? "RASPBERRY DETECTED" : "RASPBERRY NOT DETECTED",
+                cv::Point(text_x, status_y),
+                cv::FONT_HERSHEY_SIMPLEX,
+                text_scale,
+                detected ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255),
+                text_thickness);
+
+    return true;
+}
+
+// Shared webcam loop; if use_roi=true, only the central ROI is fed to the classifier.
+static void run_camera_demo(bool use_roi) {
+    cv::VideoCapture cap;
+    if (!open_camera(cap)) {
+        fprintf(stderr, "Failed to open a camera (tried indices 0/1 with common backends).\n");
+        return;
+    }
+    const cv::Scalar text_color(0, 255, 255);
+    const double text_scale = 0.7;
+    const int text_thickness = 2;
+    const char* window_name =
+        use_roi ? "Webcam Strawberry Classifier (ROI)" : "Webcam Strawberry Classifier";
+
+    while (true) {
+        cv::Mat frame;
+        cap >> frame;
+        if (frame.empty()) {
+            fprintf(stderr, "Camera frame is empty, stopping.\n");
+            break;
+        }
+
+        if (!classify_and_overlay(frame, use_roi, text_color, text_scale, text_thickness)) {
+            break;
+        }
+
+        cv::imshow(window_name, frame);
+        const int key = cv::waitKey(1);
+        if (key == 27 || key == 'q' || key == 'Q') {
+            break;
+        }
+    }
+}
+
+// Demo 1: classify full-frame webcam feed and overlay result.
+void run_webcam_demo() {
+    run_camera_demo(false);
+}
+
+// Demo 2: classify only a central circular ROI with a visible reticle.
+void run_webcam_demo_with_roi() {
+    run_camera_demo(true);
+}
+
+int main(int argc, char** argv) {
+    if (argc >= 2 && strcmp(argv[1], "--roi") == 0) {
+        run_webcam_demo_with_roi();
+    } else {
+        run_webcam_demo();
+    }
     return 0;
 }
-#endif  // STRAWBERRY_DEMO
