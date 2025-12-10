@@ -66,6 +66,12 @@ class Config:
     green_s_min: int = 60
     green_v_min: int = 60
     v_min_considered: int = 40
+    # --- Variante rose (tolérer des framboises claires) ---
+    pink_enabled: bool = True
+    pink_h_low: int = 150
+    pink_h_high: int = 175
+    pink_s_min: int = 80
+    pink_v_min: int = 120
 
     # --- Nettoyage masque ---
     morph_open_ks: int = 5
@@ -449,6 +455,10 @@ def red_mask_rrggbb(bgr: np.ndarray, cfg: Config) -> np.ndarray:
     gs_min = clamp(cfg.green_s_min, 0, 255)
     gv_min = clamp(cfg.green_v_min, 0, 255)
     v_considered = clamp(cfg.v_min_considered, 0, 255)
+    ph_lo = clamp(cfg.pink_h_low, 0, 179)
+    ph_hi = clamp(cfg.pink_h_high, 0, 179)
+    ps_min = clamp(cfg.pink_s_min, 0, 255)
+    pv_min = clamp(cfg.pink_v_min, 0, 255)
 
     # Masque éblouissement (très lumineux + peu saturé) pour exclusion.
     mask_glare = cv2.inRange(v, glare_v, 255) & cv2.inRange(s, 0, glare_s)
@@ -483,6 +493,11 @@ def red_mask_rrggbb(bgr: np.ndarray, cfg: Config) -> np.ndarray:
             mask_red,
             cv2.inRange(hsv, (rh2_lo, rs_min, rv_min), (rh2_hi, 255, 255)),
         )
+
+    # Variante rose: teinte plus large et saturation minimale plus faible.
+    if cfg.pink_enabled and ph_lo <= ph_hi:
+        mask_pink = cv2.inRange(hsv, (ph_lo, ps_min, pv_min), (ph_hi, 255, 255))
+        mask_red = cv2.bitwise_or(mask_red, mask_pink)
 
     mask_red = cv2.bitwise_and(mask_red, mask_considered)
     return mask_red
