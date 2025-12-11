@@ -57,21 +57,21 @@ class Config:
     red_h_high_1: int = 10
     red_h_low_2: int = 170
     red_h_high_2: int = 180
-    red_s_min: int = 140
-    red_v_min: int = 110
+    red_s_min: int = 40
+    red_v_min: int = 40
     glare_v_min: int = 230
     glare_s_max: int = 30
     green_h_low: int = 35
     green_h_high: int = 85
     green_s_min: int = 60
     green_v_min: int = 60
-    v_min_considered: int = 30  # un peu plus tolérant pour les teintes claires
+    v_min_considered: int = 15  # très permissif pour capturer tous les rouges/roses  # un peu plus tolérant pour les teintes claires
     # --- Variante rose (tolérer des framboises claires) ---
     pink_enabled: bool = True
-    pink_h_low: int = 140
+    pink_h_low: int = 130
     pink_h_high: int = 179
-    pink_s_min: int = 20   # encore plus bas pour laisser passer le rose très pâle
-    pink_v_min: int = 60   # plus bas pour rose peu saturé / peu lumineux
+    pink_s_min: int = 3   # extrêmement bas pour capturer rose très pâle/blanc-rose
+    pink_v_min: int = 15   # très bas pour rose peu lumineux
 
     # --- Nettoyage masque ---
     morph_open_ks: int = 5
@@ -675,14 +675,17 @@ def main():
                         (0, 255, 0) if ripe else (0, 0, 255),
                         2,
                     )
+                    # Calcul du ratio width/height
+                    aspect_ratio_display = float(w) / max(1.0, float(h))
+                    
                     # Format display text based on bundle/single and ripe status
                     if ripe:
                         if is_bundle:
-                            display_text = f"bundle : {size_label.lower()}"
+                            display_text = f"bundle : {size_label.lower()} | width={width_px}px | ratio={aspect_ratio_display:.2f}"
                         else:
-                            display_text = f"single : {size_label.lower()}"
+                            display_text = f"single : {size_label.lower()} | width={width_px}px | ratio={aspect_ratio_display:.2f}"
                     else:
-                        display_text = "unripe raspberries"
+                        display_text = f"unripe raspberries | width={width_px}px | ratio={aspect_ratio_display:.2f}"
                     
                     cv2.putText(
                         frame,
